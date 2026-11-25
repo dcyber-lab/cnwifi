@@ -20,6 +20,11 @@ for n in $(list_physical_eth); do
   printf '  %-12s 链路=%s 速率=%s master=%s\n' "$n" "$(cat /sys/class/net/$n/carrier 2>/dev/null | sed 's/1/up/;s/0/down/')" \
     "$(cat /sys/class/net/$n/speed 2>/dev/null || echo ?)" "$(basename "$(readlink /sys/class/net/$n/master 2>/dev/null)" 2>/dev/null || true)"
 done
+for n in $(list_wireless); do
+  modes=$(wifi_modes "$n")
+  if [[ -z $modes ]]; then ap="未知（装 iw 后再看）"; elif grep -qx AP <<<"$modes"; then ap="支持（没有 AP 时可作 LAN_IF，见 README）"; else ap="不支持"; fi
+  printf '  %-12s 无线网卡  热点(AP)模式=%s\n' "$n" "$ap"
+done
 
 sec "路由 / 策略路由"
 ip -4 route | sed 's/^/  /'

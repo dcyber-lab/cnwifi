@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cnwifi — 回国 Wi-Fi 管理工具（N150 端，安装到 /usr/local/sbin/cnwifi）
 #
-#   cnwifi status      查看状态（服务、隧道、策略路由、防火墙计数、DHCP 租约、日志）
+#   cnwifi status      查看状态（服务、隧道、策略路由、防火墙计数、热点、DHCP 租约、日志）
 #   cnwifi test        验收自检（出口 IP、DNS、fail-closed 防护是否完整）
 #   cnwifi failtest    断网演练：停 wstunnel、再停 wg0，确认不会漏到新加坡，然后恢复
 #   cnwifi apply       加载/修复防护（防火墙 + 策略路由 + LAN 地址）；开机由 cnwifi-policy.service 调用
@@ -12,6 +12,7 @@ set -uo pipefail
 
 CONF=${CNWIFI_CONF:-/etc/cnwifi/cnwifi.env}
 NFT_FILE=/etc/cnwifi/cnwifi.nft
+AP_CONF=/etc/cnwifi/hostapd.conf   # 存在 = 热点模式（LAN_IF 是无线网卡，N150 自己发射回国 Wi-Fi）
 LOG=/var/log/cnwifi.log
 STATE=/run/cnwifi
 P_LAN=1000 P_LAN_BH=1001 P_DNS=1002 P_DNS_BH=1003
@@ -37,12 +38,19 @@ need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root：sudo cnwifi $*" >&2; ex
 have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; }
 
 wg_up() { [[ -n $(ip link show dev "$WG_IF" up 2>/dev/null) ]]; }
+ap_mode() { [[ -e $AP_CONF ]]; }
+units() {  # 常驻服务，按启动顺序
+  echo cnwifi-policy cnwifi-dnsmasq
+  ap_mode && echo cnwifi-hostapd
+  echo cnwifi-wstunnel "wg-quick@$WG_IF"
+}
 
 svc_active() {  # 没有 systemd 时退化为看进程/接口
   if have_systemd; then systemctl is-active -q "$1"; return; fi
   case $1 in
     cnwifi-policy*)   check_guards >/dev/null ;;
     cnwifi-dnsmasq*)  pgrep -f 'dnsmasq .*cnwifi' >/dev/null ;;
+    cnwifi-hostapd*)  pgrep -f "hostapd .*$AP_CONF" >/dev/null ;;
     cnwifi-wstunnel*) pgrep -f 'wstunnel client' >/dev/null ;;
     wg-quick@*)       wg_up ;;
     *) return 1 ;;
@@ -151,6 +159,9 @@ handshake_age() {
 leak_counter() {  # leak-guard 规则累计丢弃的包数
   nft -a list chain inet cnwifi forward 2>/dev/null | awk '/leak-guard/{for(i=1;i<=NF;i++) if($i=="packets"){print $(i+1); exit}}'
 }
+dig_a() {  # 经本机 dnsmasq 查 $1 的 A 记录；失败时 dig +short 会输出 ";; ..." 错误行，只认 IPv4 地址
+  dig +short +time=5 +tries=1 @"$LAN_ADDR" "$1" A 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | tail -1
+}
 egress_via() {  # $1 = 网卡（空 = 走默认路由）；输出第一个查询成功的结果
   local u r args=(-4 -fsS --max-time 12)
   [[ -n ${1:-} ]] && args+=(--interface "$1")
@@ -198,7 +209,7 @@ cmd_watchdog() {
 cmd_status() {
   local u
   hdr "== 服务"
-  for u in cnwifi-policy cnwifi-dnsmasq cnwifi-wstunnel "wg-quick@$WG_IF" cnwifi-watchdog.timer; do
+  for u in $(units) cnwifi-watchdog.timer; do
     printf '  %-26s %s\n' "$u" "$(svc_active "$u" && echo active || echo INACTIVE)"
   done
   hdr "== 隧道"
@@ -214,6 +225,22 @@ cmd_status() {
   echo "  table $RT_TABLE:"; ip route show table "$RT_TABLE" | sed 's/^/    /'
   echo "  回国 Wi-Fi 客户端访问 1.1.1.1 → $(route_verdict 1.1.1.1)   （wg=走隧道 blocked=黑洞 LEAK=泄漏）"
   echo "  泄漏拦截计数 (eth1→eth0 被丢弃): $(leak_counter)"
+  if ap_mode; then
+    hdr "== Wi-Fi 热点 ($LAN_IF)"
+    if command -v iw >/dev/null; then
+      iw dev "$LAN_IF" info 2>/dev/null | awk '$1 ~ /^(ssid|type|channel|txpower)$/ {sub(/^[ \t]+/, "  "); print}'
+      echo "  已连接设备（MAC  IP  主机名  信号  已连时长）:"
+      iw dev "$LAN_IF" station dump 2>/dev/null | awk -v leases=/var/lib/cnwifi/dnsmasq.leases '
+        BEGIN { while ((getline l < leases) > 0) { split(l, f, " "); ip[f[2]] = f[3]; host[f[2]] = f[4] } }
+        function out() { if (mac != "") { printf "    %s  %-15s %-20s %s dBm  %ss\n", mac, ip[mac], host[mac], sig, ct; n++ } }
+        $1 == "Station" { out(); mac = $2; sig = "?"; ct = "?" }
+        $1 == "signal:" { sig = $2 }
+        $1 == "connected" && $2 == "time:" { ct = $3 }
+        END { out(); if (!n) print "    （暂无）" }'
+    else
+      note "没有 iw 命令，看不到热点状态（apt install iw）"
+    fi
+  fi
   hdr "== DHCP 租约"
   if [[ -s /var/lib/cnwifi/dnsmasq.leases ]]; then
     awk '{printf "  %s  %s  %s\n", $3, $2, $4}' /var/lib/cnwifi/dnsmasq.leases
@@ -230,7 +257,7 @@ cmd_test() {
   FAILS=0
   local u v m mtu_payload r d
   hdr "[1] 服务"
-  for u in cnwifi-policy cnwifi-dnsmasq cnwifi-wstunnel "wg-quick@$WG_IF"; do
+  for u in $(units); do
     svc_active "$u" && ok "$u" || bad "$u 未运行"
   done
   have_systemd && { systemctl is-active -q cnwifi-watchdog.timer && ok "cnwifi-watchdog.timer" || bad "cnwifi-watchdog.timer 未运行"; }
@@ -263,9 +290,9 @@ cmd_test() {
 
   hdr "[5] DNS"
   if command -v dig >/dev/null; then
-    r=$(dig +short +time=5 +tries=1 @"$LAN_ADDR" www.taobao.com A | tail -1)
+    r=$(dig_a www.taobao.com)
     [[ -n $r ]] && ok "dnsmasq($LAN_ADDR) 解析 www.taobao.com → $r" || bad "dnsmasq($LAN_ADDR) 解析失败"
-    r=$(dig +short +time=5 +tries=1 @"$LAN_ADDR" whoami.akamai.net A | tail -1)
+    r=$(dig_a whoami.akamai.net)
     [[ -n $r ]] && note "上游递归 DNS 出口（应为阿里 DNS 大陆节点）: $r"
   else
     note "未安装 dig，跳过"
@@ -340,6 +367,8 @@ cmd_failtest() {
 cmd_uninstall() {
   need_root uninstall
   read -r -p "确定卸载回国 Wi-Fi？[y/N] " a; [[ $a == y || $a == Y ]] || return 1
+  # 先关热点（有线模式下没有这个 unit，单独处理，不影响下面几个的 disable）
+  [[ -e /etc/systemd/system/cnwifi-hostapd.service ]] && svc disable --now cnwifi-hostapd.service 2>/dev/null
   svc disable --now cnwifi-watchdog.timer cnwifi-dnsmasq.service 2>/dev/null
   ip addr del "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF" 2>/dev/null   # 先撤网关，客户端立刻失去出口
   svc disable --now cnwifi-wstunnel.service "wg-quick@$WG_IF.service" 2>/dev/null
@@ -347,7 +376,7 @@ cmd_uninstall() {
   ip route flush table "$RT_TABLE" 2>/dev/null
   nft delete table inet cnwifi 2>/dev/null
   svc disable --now cnwifi-policy.service 2>/dev/null
-  rm -f /etc/systemd/system/cnwifi-{policy,dnsmasq,wstunnel,watchdog}.{service,timer} \
+  rm -f /etc/systemd/system/cnwifi-{policy,dnsmasq,hostapd,wstunnel,watchdog}.{service,timer} \
         /etc/systemd/system/wg-quick@"$WG_IF".service.d/cnwifi.conf \
         /etc/sysctl.d/99-zzz-cnwifi.conf /etc/logrotate.d/cnwifi \
         /etc/NetworkManager/conf.d/90-cnwifi.conf /etc/systemd/network/05-cnwifi-lan.network

@@ -27,6 +27,9 @@ n150_priv=$(wg genkey); n150_pub=$(wg pubkey <<<"$n150_priv")
 psk=$(wg genpsk)
 secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 port=$(( 30000 + $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 10000 ))
+# 热点密码：12 位，去掉易混的 0/O/1/l/I
+wifi_pass=$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9'); wifi_pass=${wifi_pass:0:12}
+[[ ${#wifi_pass} -eq 12 ]] || die "生成 Wi-Fi 密码失败"
 
 umask 077
 cat >"$OUT" <<EOF
@@ -55,7 +58,7 @@ WG_PSK=$psk
 
 # ---------- N150 / 回国 Wi-Fi ----------
 WAN_IF=$wan                  # 接主路由的网卡（自动检测，请核对）
-LAN_IF=$lan                  # 接 AP 的网卡（自动检测，请核对）
+LAN_IF=$lan                  # 接 AP 的网卡（自动检测，请核对）；没有 AP 可填无线网卡名，N150 自己当热点
 LAN_ADDR=192.168.50.1
 LAN_PREFIX=24
 DHCP_START=192.168.50.100
@@ -63,9 +66,17 @@ DHCP_END=192.168.50.150
 UPSTREAM_DNS="223.5.5.5 223.6.6.6"
 RT_TABLE=100
 
+# ---------- 热点模式（只有 LAN_IF 是无线网卡时才用） ----------
+WIFI_SSID=CN-WiFi            # 含空格或中文要加单引号
+WIFI_PASS=$wifi_pass         # WPA2 密码，8–63 位
+WIFI_CHANNEL=11              # 只支持 2.4 GHz 信道 1–13（扫地机只认 2.4 GHz）
+WIFI_COUNTRY=SG              # 国家代码，决定可用信道和发射功率
+
 # 验收时用来查出口 IP 的网址（第一个能访问的为准）
 IPCHECK_URLS="https://myip.ipip.net https://cip.cc https://ip.sb"
 EOF
 log "已生成 $OUT"
 log "  ECS: $ECS_IP  wstunnel 端口: TCP $port"
 log "  WAN_IF=$wan  LAN_IF=$lan   ← 请核对网卡名"
+wlans=$(list_wireless | tr '\n' ' ')
+[[ -z $wlans ]] || log "  没有 AP 的话，可以把 LAN_IF 改成无线网卡（$wlans）让 N150 自己当热点，见 README"

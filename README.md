@@ -11,19 +11,33 @@
    └─ wstunnel client ──WSS(TCP 3xxxx, 直连 IP)──▶ ECS wstunnel server ─▶ 127.0.0.1:51820 WireGuard ─▶ 大陆出口
 ```
 
+没有 AP 时，LAN_IF 也可以直接用 N150 自带的无线网卡，由 N150 自己发射回国 Wi-Fi（见[下文](#没有-ap-时用-n150-自带无线)）。
+
 ## 文件
 
 | 文件 | 在哪跑 | 作用 |
 |---|---|---|
-| `preflight.sh` | N150 | 只读预检：网卡、路由、网络管理器、防火墙、53/67 端口 |
-| `gen-config.sh <ECS_IP>` | N150 | 生成 `config.env`：随机端口、路径密钥、两端 WG 密钥（含私钥，600 权限） |
+| `preflight.sh` | N150 | 只读预检：网卡（含无线网卡是否支持 AP）、路由、网络管理器、防火墙、53/67 端口 |
+| `gen-config.sh <ECS_IP>` | N150 | 生成 `config.env`：随机端口、路径密钥、两端 WG 密钥、热点密码（含私钥，600 权限） |
 | `fetch-wstunnel.sh` | N150 | 从 GitHub 下载 wstunnel v11.1.0（amd64+arm64）并校验 sha256 |
 | `make-ecs-bundle.sh` | N150 | 打包 `dist/cnwifi-ecs.tar.gz`（只含 ECS 需要的密钥） |
 | `deploy-ecs.sh [root@IP] [ssh参数]` | N150 | scp + ssh 到 ECS 执行安装 |
 | `ecs/setup.sh` | ECS | ECS 端安装（WG、wstunnel、nftables、systemd） |
-| `n150/setup.sh` | N150 | N150 端安装（WG、wstunnel、dnsmasq、策略路由、nftables、看门狗） |
+| `n150/setup.sh` | N150 | N150 端安装（WG、wstunnel、dnsmasq、策略路由、nftables、看门狗；LAN_IF 是无线网卡时再加 hostapd 热点）。可重复运行，换 LAN 口也直接重跑 |
 | `n150/cnwifi` | N150 | 装到 `/usr/local/sbin/cnwifi`：status / test / failtest / watchdog / uninstall |
-| `sim/` | 开发机 | 网络命名空间仿真测试（39 项），不用部署 |
+| `sim/` | 开发机 | 网络命名空间仿真测试（含换 LAN 口重装），不用部署 |
+
+N150 上安装后生成的文件（都在 `/etc/cnwifi/` 和 `/etc/systemd/system/`）：
+
+| 文件 | 作用 |
+|---|---|
+| `cnwifi.env` | `cnwifi` 工具读的配置（不含密钥） |
+| `wstunnel-client.env`、`/etc/wireguard/wg0.conf` | 路径密钥、WG 私钥（600） |
+| `cnwifi.nft`、`dnsmasq.conf` | 防火墙规则；只服务 LAN_IF 的 DHCP/DNS |
+| `hostapd.conf` | 仅热点模式：SSID、Wi-Fi 密码（600） |
+| `cnwifi-policy.service` | 开机最先跑 `cnwifi apply`：防火墙 → 黑洞路由 → 策略规则 → 网关地址 |
+| `cnwifi-dnsmasq.service`、`cnwifi-wstunnel.service`、`wg-quick@wg0`、`cnwifi-watchdog.timer` | DHCP/DNS、隧道、看门狗 |
+| `cnwifi-hostapd.service` | 仅热点模式：`Requires/After=cnwifi-policy`，防护就位后才发射信号 |
 
 ## 部署步骤
 
@@ -45,6 +59,38 @@ sudo ./n150/setup.sh                # 装完自动跑 cnwifi test
 sudo cnwifi failtest 60             # 断网演练；每步停 60 秒，期间用手机试 cip.cc 应打不开
 ```
 
+## 没有 AP 时用 N150 自带无线
+
+`gen-config.sh` 只自动识别有线 LAN 口。手头没有 AP（或 AP 没电）时，把 `config.env` 里的 `LAN_IF` 改成
+N150 的无线网卡名（`sudo ./preflight.sh` 会列出无线网卡和是否支持 AP 模式，常见名字 `wlo1` / `wlp1s0`），
+再跑 `sudo ./n150/setup.sh`。setup 发现 LAN_IF 是无线网卡就会：
+
+- 安装 `hostapd` 和 `iw`。系统自带的 `hostapd.service`（Ubuntu 装完是 masked 的）保持不动，不用管；
+- 按 `config.env` 写 `/etc/cnwifi/hostapd.conf`（权限 600），WPA2-PSK / CCMP，最多 16 台设备；
+- 装 `cnwifi-hostapd.service`：`Requires=` + `After=cnwifi-policy.service`，**防火墙、策略路由、网关地址都就位之后才发射信号**，
+  fail-closed 和有线模式完全一样。
+
+热点参数在 `config.env` 里（gen-config 生成的新配置自带；旧配置没有就手动加上）：
+
+```bash
+LAN_IF=wlo1                  # 无线网卡名
+WIFI_SSID=CN-WiFi            # 含空格或中文要加单引号，最长 32 字节
+WIFI_PASS=xxxxxxxxxxxx       # WPA2 密码 8–63 位；gen-config 随机生成 12 位
+WIFI_CHANNEL=11              # 只支持 2.4 GHz 信道 1–13
+WIFI_COUNTRY=SG              # 国家代码，决定可用信道和发射功率
+```
+
+注意：
+
+- **只开 2.4 GHz**。石头等扫地机、很多智能家居只认 2.4 GHz；Intel 网卡在 5 GHz 一般也不允许开 AP。
+- 无线网卡要支持 AP 模式（`iw list` 的 `Supported interface modes` 里有 `* AP`，Intel AX101 实测可用），
+  且不能同时拿来连家里 Wi-Fi：WAN 走有线。netplan 的 `wifis:` 里配了这块网卡的话先删掉，setup 预检会拦下。
+- 网卡被 rfkill 软关闭时（`rfkill list` 显示 `Soft blocked: yes`）先 `sudo rfkill unblock wifi`。
+- N150 内置天线一般较弱，尽量把 N150 放在扫地机附近。
+- `cnwifi status` 的「Wi-Fi 热点」一栏显示 SSID、信道和已连接设备（MAC / IP / 主机名 / 信号）。
+- 有线 ↔ 无线互换、或换别的网口：改 `LAN_IF` 后直接重跑 setup。上次安装留在旧网口上的网关地址和
+  `iif 旧网口` 的策略路由会被识别为自己的、自动撤掉（期间 nft 防护一直加载着）；从无线换回有线时会停掉并删除 cnwifi-hostapd。
+
 ## fail-closed 是怎么保证的（四层，任何一层单独失效都不会漏）
 
 1. **策略路由**：`ip rule pref 1000 iif LAN_IF lookup 100`；table 100 = `default dev wg0 metric 100` + `blackhole default metric 200`。
@@ -52,6 +98,7 @@ sudo cnwifi failtest 60             # 断网演练；每步停 60 秒，期间�
 2. **规则级黑洞**：`ip rule pref 1001 iif LAN_IF blackhole`。即使 table 100 被清空，也不会落到 main 表。
 3. **nftables**（独立的 `table inet cnwifi`）：转发只放行 LAN↔wg0；`LAN → WAN` 显式丢弃并计数（leak-guard）。
 4. **开机顺序**：`cnwifi apply` 先装防火墙、黑洞、规则，**最后**才给 LAN 口配 192.168.50.1。网关地址出现前设备根本无路可走。
+   热点模式下 hostapd 排在这之后才启动，信号出现时防护早已就位。
 
 另外：wstunnel 停了时，流量仍进 wg0，被 WireGuard 加密后发往已停止的本地端口然后丢弃，不可能明文出去。
 上游 DNS（223.5.5.5/223.6.6.6）同样走 table 100 + 黑洞（pref 1002/1003），隧道断了 N150 也不会从新加坡去查。
@@ -76,6 +123,7 @@ cnwifi status            # 服务 / 隧道 / 防护 / 租约 / 日志
 sudo cnwifi test         # 验收自检
 sudo cnwifi failtest 60  # 断网演练
 journalctl -u cnwifi-wstunnel -u wg-quick@wg0 -f
+journalctl -u cnwifi-hostapd -f   # 热点模式：设备连接/断开、认证失败
 ```
 
 - 视频卡：ECS 带宽改按流量计费、调高峰值，不用换机器；MTU 可在 `config.env` 的 `WG_MTU` 调（1280–1380），改完两端重新跑 setup。
@@ -85,3 +133,4 @@ journalctl -u cnwifi-wstunnel -u wg-quick@wg0 -f
 ## 扫地机配网
 
 手机连回国 Wi-Fi，先打开 cip.cc 确认显示的是大陆 IP，再打开石头 App，地区选「中国大陆」，给扫地机配网，让扫地机连回国 Wi-Fi。配完手机切回家里 Wi-Fi 即可。
+扫地机只支持 2.4 GHz：用外部 AP 时要开 2.4 GHz（或双频同名）；热点模式默认就是 2.4 GHz。

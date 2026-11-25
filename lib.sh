@@ -27,15 +27,32 @@ detect_wan_if() {
   ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
+is_wireless() { [[ -d /sys/class/net/$1/wireless || -e /sys/class/net/$1/phy80211 ]]; }
+
 # 物理有线网卡（有 device 目录、不是无线网卡）
 list_physical_eth() {
   local p n
   for p in /sys/class/net/*; do
     n=${p##*/}
     [[ -e $p/device ]] || continue
-    [[ -d $p/wireless || -e $p/phy80211 ]] && continue
+    is_wireless "$n" && continue
     echo "$n"
   done
+}
+
+# 无线网卡（可以用作 LAN_IF，由 N150 自己当热点）
+list_wireless() {
+  local p
+  for p in /sys/class/net/*; do is_wireless "${p##*/}" && echo "${p##*/}"; done
+  return 0
+}
+
+# 无线网卡 $1 支持的工作模式，每行一个（managed / AP / monitor ...）；没有 iw 或查不到时输出为空
+wifi_modes() {
+  command -v iw >/dev/null || return 0
+  iw phy "$(cat "/sys/class/net/$1/phy80211/name" 2>/dev/null)" info 2>/dev/null \
+    | awk '/Supported interface modes:/{f=1; next} f && $1 != "*" {exit} f {print $2}'
+  return 0
 }
 
 # 猜测 LAN 口：除 WAN 以外唯一的物理有线网卡；猜不出来就返回空

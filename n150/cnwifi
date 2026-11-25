@@ -7,6 +7,7 @@
 #   cnwifi apply       加载/修复防护（防火墙 + 策略路由 + LAN 地址）；开机由 cnwifi-policy.service 调用
 #   cnwifi check       只检查防护是否完整（返回码 0 = 完整）
 #   cnwifi watchdog    看门狗（cnwifi-watchdog.timer 每分钟调用）
+#   cnwifi bbr-route   到 ECS 的主机路由开 BBR（cnwifi-wstunnel 每次启动前自动调用）
 #   cnwifi uninstall   卸载
 set -uo pipefail
 
@@ -205,6 +206,24 @@ cmd_watchdog() {
   fi
 }
 
+# ---------------------------------------------------------------- BBR
+# 外层 wstunnel 是一条跨境长 TCP（RTT 300ms+、晚高峰丢包 10–30%），cubic 会塌到几乎不动，WG 握手和看门狗的
+# ping 都卡在它后面。只给到 ECS 的主机路由加 congctl bbr，本机其它连接仍用系统默认的拥塞控制。
+# 下一跳照抄当前路由，每次 wstunnel 启动前刷新（网关变了也跟着变）。不影响 fail-closed：客户端流量由
+# iif LAN_IF 的策略规则送进 table $RT_TABLE，根本不查 main 表里的这条路由。
+has_bbr_route() { ip -4 route show "$ECS_IP/32" 2>/dev/null | grep -q 'congctl bbr'; }
+cmd_bbr_route() {
+  need_root bbr-route
+  local r via dev
+  modprobe tcp_bbr 2>/dev/null
+  has_bbr_route && ip route del "$ECS_IP/32"
+  r=$(ip -4 route get "$ECS_IP" 2>/dev/null) || { echo "到 $ECS_IP 没有路由" >&2; return 1; }
+  via=$(awk '{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$r")
+  dev=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$r")
+  [[ -n $dev ]] || { echo "看不懂路由: $r" >&2; return 1; }
+  ip route replace "$ECS_IP/32" ${via:+via "$via"} dev "$dev" congctl bbr
+}
+
 # ---------------------------------------------------------------- 状态
 cmd_status() {
   local u
@@ -216,6 +235,8 @@ cmd_status() {
   if wg_up; then
     wg show "$WG_IF" | sed 's/^/  /'
     tunnel_ok && ok "ping ECS 隧道地址 $WG_ECS_ADDR 通" || bad "ping ECS 隧道地址 $WG_ECS_ADDR 不通"
+    echo "  外层 wstunnel TCP 拥塞控制: $(ss -tin dst "$ECS_IP" 2>/dev/null | grep -oE '\b(bbr2?|cubic|reno|htcp|westwood)\b' | head -1)" \
+         "（到 ECS 的主机路由 congctl bbr: $(has_bbr_route && echo 有 || echo 无)）"
   else
     bad "$WG_IF 不存在/未启动"
   fi
@@ -372,12 +393,14 @@ cmd_uninstall() {
   svc disable --now cnwifi-watchdog.timer cnwifi-dnsmasq.service 2>/dev/null
   ip addr del "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF" 2>/dev/null   # 先撤网关，客户端立刻失去出口
   svc disable --now cnwifi-wstunnel.service "wg-quick@$WG_IF.service" 2>/dev/null
+  has_bbr_route && ip route del "$ECS_IP/32"
   del_rules
   ip route flush table "$RT_TABLE" 2>/dev/null
   nft delete table inet cnwifi 2>/dev/null
   svc disable --now cnwifi-policy.service 2>/dev/null
   rm -f /etc/systemd/system/cnwifi-{policy,dnsmasq,hostapd,wstunnel,watchdog}.{service,timer} \
         /etc/systemd/system/wg-quick@"$WG_IF".service.d/cnwifi.conf \
+        /etc/systemd/system/cnwifi-wstunnel.service.d/bbr.conf \
         /etc/sysctl.d/99-zzz-cnwifi.conf /etc/logrotate.d/cnwifi \
         /etc/NetworkManager/conf.d/90-cnwifi.conf /etc/systemd/network/05-cnwifi-lan.network
   grep -qF "$MARK" "/etc/wireguard/$WG_IF.conf" 2>/dev/null && rm -f "/etc/wireguard/$WG_IF.conf"
@@ -395,6 +418,7 @@ case ${1:-status} in
   failtest)  shift; cmd_failtest "${1:-0}" ;;
   watchdog)  cmd_watchdog ;;
   uninstall) cmd_uninstall ;;
-  -h|--help|help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  bbr-route) cmd_bbr_route ;;
+  -h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) echo "未知命令 $1（cnwifi help）"; exit 2 ;;
 esac

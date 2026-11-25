@@ -38,6 +38,7 @@ N150 上安装后生成的文件（都在 `/etc/cnwifi/` 和 `/etc/systemd/syste
 | `cnwifi-policy.service` | 开机最先跑 `cnwifi apply`：防火墙 → 黑洞路由 → 策略规则 → 网关地址 |
 | `cnwifi-dnsmasq.service`、`cnwifi-wstunnel.service`、`wg-quick@wg0`、`cnwifi-watchdog.timer` | DHCP/DNS、隧道、看门狗 |
 | `cnwifi-hostapd.service` | 仅热点模式：`Requires/After=cnwifi-policy`，防护就位后才发射信号 |
+| `cnwifi-wstunnel.service.d/bbr.conf` | wstunnel 每次启动前跑 `cnwifi bbr-route`：只给到 ECS 的主机路由开 BBR |
 
 ## 部署步骤
 
@@ -115,6 +116,11 @@ WIFI_COUNTRY=SG              # 国家代码，决定可用信道和发射功率
   - wstunnel 用自签证书，不用它内置的证书，避免证书指纹被识别。
   - 用路径密钥做认证：错误密钥或非 WG 目标的连接都会被拒。
   - 回国网段禁用 IPv6；dnsmasq ≥ 2.87 时（Debian 12、Ubuntu 24.04）不下发 AAAA 记录。
+  - 外层 wstunnel TCP 用 BBR。新加坡→广州晚高峰实测 RTT ~340ms、丢包 10–30%，cubic 下这条 TCP 会塌掉
+    （ssthresh 掉到 2），WG 握手和看门狗 ping 跟着卡住，看门狗又反复重启 wstunnel；两端开 BBR 后隧道 ping 不丢包。
+    ECS 是专用机，全局开（`/etc/sysctl.d/99-zzz-cnwifi-bbr.conf` + `/etc/modules-load.d/cnwifi-bbr.conf`）；
+    N150 可能还跑着别的服务，只给到 ECS 的那条主机路由加 `congctl bbr`（`cnwifi bbr-route`，wstunnel 每次启动前刷新，
+    失败不影响隧道）。`cnwifi status` 的「隧道」一栏显示当前用的是哪个算法。
 
 ## 日常
 

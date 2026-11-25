@@ -469,6 +469,14 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 EOF
 
+# 外层 TCP 用 BBR，只对到 ECS 的主机路由生效（见 cnwifi bbr-route）。"-" 失败也照常起隧道，"+" 以 root 运行
+install -d /etc/systemd/system/cnwifi-wstunnel.service.d
+cat >/etc/systemd/system/cnwifi-wstunnel.service.d/bbr.conf <<EOF
+$MARK
+[Service]
+ExecStartPre=-+/usr/local/sbin/cnwifi bbr-route
+EOF
+
 install -d "/etc/systemd/system/wg-quick@$WG_IF.service.d"
 cat >"/etc/systemd/system/wg-quick@$WG_IF.service.d/cnwifi.conf" <<EOF
 $MARK

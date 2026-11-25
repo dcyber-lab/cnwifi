@@ -8,6 +8,8 @@ UD=/etc/systemd/system
 norm() { local u=$1; [[ $u == *.* ]] || u=$u.service; echo "$u"; }
 field() { sed -n "s/^$2=//p" "$UD/$1" | tail -1; }
 execstart() { awk '/^ExecStart=/{f=1; sub(/^ExecStart=/,"")} f{ if (sub(/\\$/,"")) printf "%s ", $0; else { print; exit } }' "$UD/$1"; }
+# 所有 ExecStartPre，按 systemd 的顺序：主 unit 在前，drop-in（<unit>.d/*.conf）追加在后
+execstartpre() { cat "$UD/$1" "$UD/$1.d"/*.conf 2>/dev/null | sed -n 's/^ExecStartPre=//p'; }
 wgif() { local i=${1#wg-quick@}; echo "${i%.service}"; }
 
 is_active() {
@@ -22,12 +24,15 @@ is_active() {
 }
 
 # 在当前（子）shell 里 exec，保证后台启动时 $! 就是服务进程本身
-run_exec() {  # $1=unit $2=cmdline（含 ${VAR}）
-  local u=$1 line=$2 envf user
+run_exec() {  # $1=unit $2=cmdline（含 ${VAR}） $3=1 时忽略 User=（ExecStartPre 的 "+" 前缀）
+  local u=$1 line=$2 asroot=${3:-0} envf user
   envf=$(field "$u" EnvironmentFile); user=$(field "$u" User)
-  set -a; [[ -n $envf ]] && . "${envf#-}"; set +a
+  set -a
+  # shellcheck disable=SC1090
+  [[ -n $envf ]] && . "${envf#-}"
+  set +a
   line=$(eval "printf '%s' \"$line\"")
-  if [[ -n $user ]]; then
+  if [[ -n $user && $asroot != 1 ]]; then
     exec setpriv --reuid="$user" --regid="$user" --init-groups -- $line
   else
     exec $line
@@ -42,10 +47,15 @@ start() {
     *.timer) touch "$RUN/$u.active"; return 0 ;;
   esac
   [[ -r $UD/$u ]] || { echo "Unit $u not found." >&2; return 5; }
-  local pre; pre=$(field "$u" ExecStartPre)
-  if [[ -n $pre ]]; then
-    ( run_exec "$u" "$pre" ) >>"$RUN/$u.log" 2>&1 || { echo "$u: ExecStartPre failed" >&2; return 1; }
-  fi
+  local pre ign root
+  while IFS= read -r pre; do   # 前缀 "-" = 失败也继续，"+" = 以 root 运行
+    ign=0 root=0
+    while [[ $pre == [-+]* ]]; do
+      if [[ $pre == -* ]]; then ign=1; else root=1; fi
+      pre=${pre:1}
+    done
+    ( run_exec "$u" "$pre" "$root" ) >>"$RUN/$u.log" 2>&1 || ((ign)) || { echo "$u: ExecStartPre failed" >&2; return 1; }
+  done < <(execstartpre "$u")
   if [[ $(field "$u" Type) == oneshot ]]; then
     ( run_exec "$u" "$(execstart "$u")" ) >>"$RUN/$u.log" 2>&1 || { echo "$u failed (see $RUN/$u.log)" >&2; return 1; }
     [[ $(field "$u" RemainAfterExit) == yes ]] && touch "$RUN/$u.active"

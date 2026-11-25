@@ -279,6 +279,17 @@ if grep -q "Rejecting connection.*port: 51820" <<<"$OUT"; then pass "ECS: 错误
 OUT=$(probe_ws "$SECRET" 'udp://127.0.0.1:55555:127.0.0.1:53?timeout_sec=0')
 echo "$OUT" | grep -iE 'reject|path|prefix|denied|not allowed|restrict' | head -2 | sed 's/^/    服务端日志: /'
 if grep -q "Rejecting connection.*port: 53" <<<"$OUT"; then pass "ECS: 密钥正确但目标不是 127.0.0.1:51820 也被拒（--restrict-to）"; else fail "ECS: 密钥正确但目标不是 127.0.0.1:51820 也被拒（--restrict-to）"; fi
+expect "N150：系统默认拥塞控制没被改（BBR 只用在到 ECS 的主机路由上）" \
+  bash -c "[[ \$(ip netns exec n150 sysctl -n net.ipv4.tcp_congestion_control) == \$(ip netns exec lan sysctl -n net.ipv4.tcp_congestion_control) ]]"
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+  expect "N150：到 ECS 的主机路由带 congctl bbr（wstunnel 启动前由 drop-in 加上）" bash -c "ip netns exec n150 ip route show 203.0.113.10 | grep -q 'congctl bbr'"
+  expect "N150：wstunnel 外层 TCP 用 BBR" bash -c "ip netns exec n150 ss -tin dst 203.0.113.10 | grep -qw bbr"
+  expect "ECS：外层 TCP 用 BBR" bash -c "ip netns exec ecs ss -tin sport = :$PORT | grep -qw bbr"
+else
+  echo "    （本内核没有 tcp_bbr：只验证降级——bbr-route 失败不挡隧道、不留半截路由）"
+  expect "N150：没有 BBR 时不加主机路由，隧道照常" bash -c "! ip netns exec n150 ip route show 203.0.113.10 | grep -q . && ip netns exec n150 ping -c1 -W2 -I wg0 10.66.66.1 >/dev/null"
+  expect "N150：bbr-route 确实被 wstunnel 的 drop-in 调用过" grep -q 'tcp congestion' /run/sim/n150/cnwifi-wstunnel.service.log
+fi
 X n150 cnwifi status >"$W/status.log" 2>&1; sed 's/^/    /' "$W/status.log"
 
 phase "P10 换 LAN 口重装（eth1 → eth2 → eth1），上次安装留下的地址/规则不应挡住预检"

@@ -14,7 +14,7 @@ unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy
 SIM=$(cd "$(dirname "$0")" && pwd); KIT=$(dirname "$SIM")
 WSTUNNEL_BIN=${1:-/usr/local/bin/wstunnel}
 W=/tmp/cnwifi-sim; WEBLOG=$W/web.log; ALIDNS_LOG=$W/alidns.log
-NSS=(net ecs home n150 client lan)
+NSS=(net ecs home n150 client lan client2)
 PASS=0; FAIL=0
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -279,7 +279,44 @@ if grep -q "Rejecting connection.*port: 51820" <<<"$OUT"; then pass "ECS: 错误
 OUT=$(probe_ws "$SECRET" 'udp://127.0.0.1:55555:127.0.0.1:53?timeout_sec=0')
 echo "$OUT" | grep -iE 'reject|path|prefix|denied|not allowed|restrict' | head -2 | sed 's/^/    服务端日志: /'
 if grep -q "Rejecting connection.*port: 53" <<<"$OUT"; then pass "ECS: 密钥正确但目标不是 127.0.0.1:51820 也被拒（--restrict-to）"; else fail "ECS: 密钥正确但目标不是 127.0.0.1:51820 也被拒（--restrict-to）"; fi
+expect "N150：系统默认拥塞控制没被改（BBR 只用在到 ECS 的主机路由上）" \
+  bash -c "[[ \$(ip netns exec n150 sysctl -n net.ipv4.tcp_congestion_control) == \$(ip netns exec lan sysctl -n net.ipv4.tcp_congestion_control) ]]"
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
+  expect "N150：到 ECS 的主机路由带 congctl bbr（wstunnel 启动前由 drop-in 加上）" bash -c "ip netns exec n150 ip route show 203.0.113.10 | grep -q 'congctl bbr'"
+  expect "N150：wstunnel 外层 TCP 用 BBR" bash -c "ip netns exec n150 ss -tin dst 203.0.113.10 | grep -qw bbr"
+  expect "ECS：外层 TCP 用 BBR" bash -c "ip netns exec ecs ss -tin sport = :$PORT | grep -qw bbr"
+else
+  echo "    （本内核没有 tcp_bbr：只验证降级——bbr-route 失败不挡隧道、不留半截路由）"
+  expect "N150：没有 BBR 时不加主机路由，隧道照常" bash -c "! ip netns exec n150 ip route show 203.0.113.10 | grep -q . && ip netns exec n150 ping -c1 -W2 -I wg0 10.66.66.1 >/dev/null"
+  expect "N150：bbr-route 确实被 wstunnel 的 drop-in 调用过" grep -q 'tcp congestion' /run/sim/n150/cnwifi-wstunnel.service.log
+fi
 X n150 cnwifi status >"$W/status.log" 2>&1; sed 's/^/    /' "$W/status.log"
+
+phase "P10 换 LAN 口重装（eth1 → eth2 → eth1），上次安装留下的地址/规则不应挡住预检"
+veth n150 eth2 client2 eth0
+lan_state() { echo "eth1=[$(X n150 ip -4 -o addr show dev eth1 | awk '{print $4}')] eth2=[$(X n150 ip -4 -o addr show dev eth2 | awk '{print $4}')]"; }
+sed -i 's/^LAN_IF=.*/LAN_IF=eth2/' "$W/kit/config.env"
+# 反例：别的网卡上真有冲突网段，预检仍要拦下（dummy 保持 down，不影响路由）
+X n150 ip link add cnwifi-dummy type dummy; X n150 ip addr add 192.168.50.200/24 dev cnwifi-dummy
+X n150 "$W/kit/n150/setup.sh" >"$W/n150-move-neg.log" 2>&1; rc=$?
+X n150 ip link del cnwifi-dummy
+expect "预检仍拦下真正的网段冲突（cnwifi-dummy），且没动旧安装: $(lan_state)" \
+  bash -c "[[ $rc -ne 0 ]] && grep -q 'cnwifi-dummy 上的 192.168.50.200/24 冲突' '$W/n150-move-neg.log' && [[ '$(lan_state)' == 'eth1=[192.168.50.1/24] eth2=[]' ]]"
+echo lanmove >"$W/probe-phase"
+if X n150 "$W/kit/n150/setup.sh" >"$W/n150-move.log" 2>&1; then pass "LAN_IF eth1 → eth2 重装成功（含 cnwifi test）"; else fail "LAN_IF eth1 → eth2 重装失败"; tail -20 "$W/n150-move.log" | sed 's/^/    /'; fi
+expect "网关地址从 eth1 移到 eth2: $(lan_state)" bash -c "[[ '$(lan_state)' == 'eth1=[] eth2=[192.168.50.1/24]' ]]"
+RULES=$(X n150 ip rule show | grep -E '^100[01]:')
+expect "pref 1000/1001 只剩 iif eth2 的规则" bash -c "! grep -q 'iif eth1 ' <<<'$RULES' && grep -q '^1000:.*iif eth2 lookup 100' <<<'$RULES' && grep -q '^1001:.*iif eth2 blackhole' <<<'$RULES'"
+expect "nft 表已换成 eth2" bash -c "ip netns exec n150 nft list table inet cnwifi | grep -q '\"eth2\"' && ! ip netns exec n150 nft list table inet cnwifi | grep -q '\"eth1\"'"
+expect "看门狗已重新启动" X n150 systemctl is-active -q cnwifi-watchdog.timer
+X client2 busybox udhcpc -i eth0 -n -q -t 5 -s "$W/udhcpc.sh" >>"$W/udhcpc.log" 2>&1
+R=$(X client2 curl -fsS --max-time 5 http://192.0.2.1/ 2>&1)
+expect "eth2 上的新客户端 DHCP 后出口是 ECS（$R）" bash -c "[[ '$R' == *203.0.113.10* ]]"
+expect "换口过程中没有新加坡出口的客户端探测" bash -c "! grep -qE '^198\.51\.100\.2 /probe-lanmove' '$WEBLOG'"
+sed -i 's/^LAN_IF=.*/LAN_IF=eth1/' "$W/kit/config.env"
+if X n150 "$W/kit/n150/setup.sh" >"$W/n150-moveback.log" 2>&1; then pass "LAN_IF eth2 → eth1 换回重装成功"; else fail "LAN_IF eth2 → eth1 换回重装失败"; tail -20 "$W/n150-moveback.log" | sed 's/^/    /'; fi
+expect "网关地址回到 eth1: $(lan_state)" bash -c "[[ '$(lan_state)' == 'eth1=[192.168.50.1/24] eth2=[]' ]]"
+expect "换回后防护完整" X n150 cnwifi check
 
 phase "结果"
 printf '  PASS %d   FAIL %d\n' "$PASS" "$FAIL"

@@ -24,10 +24,24 @@ cur_wan=$(detect_wan_if)
 [[ $cur_wan == "$WAN_IF" ]] || warn "config 里 WAN_IF=$WAN_IF，但当前默认路由走 ${cur_wan:-无}"
 [[ ! -e /sys/class/net/$LAN_IF/master ]] || die "$LAN_IF 是 $(basename "$(readlink -f /sys/class/net/$LAN_IF/master)") 的成员（网桥/bond），不能直接用作回国口"
 
-other=$(ip -4 -o addr show dev "$LAN_IF" | awk '{print $4}' | grep -vxF "$LAN_ADDR/$LAN_PREFIX" || true)
+# 之前装过：读出上次的 LAN 口和网关地址。换了 LAN_IF / LAN_ADDR 重装时，旧口上的网关地址和
+# iif 旧口 的 ip rule 是上次安装留下的，不算冲突；第 5 步启动前撤掉。
+old_if="" old_gw=""
+if [[ -r /etc/cnwifi/cnwifi.env ]] && grep -qxF "$MARK" /etc/cnwifi/cnwifi.env; then
+  # shellcheck disable=SC1091
+  read -r old_if old_gw < <(unset LAN_IF LAN_ADDR LAN_PREFIX; . /etc/cnwifi/cnwifi.env >/dev/null 2>&1
+    [[ -n ${LAN_IF:-} && -n ${LAN_ADDR:-} && -n ${LAN_PREFIX:-} ]] && echo "$LAN_IF $LAN_ADDR/$LAN_PREFIX") || true
+fi
+move_lan=0
+[[ -n $old_if && "$old_if $old_gw" != "$LAN_IF $LAN_ADDR/$LAN_PREFIX" ]] && move_lan=1
+
+keep=(-e "$LAN_ADDR/$LAN_PREFIX")
+[[ $old_if == "$LAN_IF" ]] && keep+=(-e "$old_gw")
+other=$(ip -4 -o addr show dev "$LAN_IF" | awk '{print $4}' | grep -vxF "${keep[@]}" || true)
 [[ -z $other ]] || die "$LAN_IF 上已有其它地址: $other（插错口？或被别的网络配置管理？）"
 while read -r cidr dev; do
   [[ $dev == "$LAN_IF" ]] && continue
+  [[ $dev == "$old_if" && $cidr == "$old_gw" ]] && continue   # 上次安装留在旧 LAN 口上的网关地址
   cidr_overlap "$cidr" "$LAN_CIDR" && die "回国网段 $LAN_CIDR 与 $dev 上的 $cidr 冲突，请改 LAN_ADDR"
 done < <(ip -4 -o addr show | awk '{print $4, $2}')
 cidr_overlap "$WG_ECS_ADDR/$WG_PREFIX" "$LAN_CIDR" && die "WG 网段与回国网段冲突"
@@ -40,7 +54,9 @@ if ip link show "$WG_IF" >/dev/null 2>&1 && [[ ! -e /etc/wireguard/$WG_IF.conf ]
 fi
 foreign_rt=$(ip route show table "$RT_TABLE" 2>/dev/null | grep -vE "^(blackhole default|default dev $WG_IF)" || true)
 [[ -z $foreign_rt ]] || die "路由表 $RT_TABLE 已被占用（请在 config.env 换个 RT_TABLE）: $foreign_rt"
-foreign_rules=$(ip rule show | grep -E '^100[0-3]:' | grep -vE "iif $LAN_IF|to (${UPSTREAM_DNS// /|}) " || true)
+ours_re="iif $LAN_IF|to (${UPSTREAM_DNS// /|}) "
+[[ -n $old_if ]] && ours_re+="|^100[01]:.* iif $old_if "   # 上次安装在旧 LAN 口上的规则
+foreign_rules=$(ip rule show | grep -E '^100[0-3]:' | grep -vE "$ours_re" || true)
 [[ -z $foreign_rules ]] || die "ip rule 优先级 1000-1003 已被占用: $foreign_rules"
 if systemctl is-active -q firewalld 2>/dev/null; then
   die "firewalld 正在运行。它会拦截转发，需要先手动放行（或停用 firewalld）后再装"
@@ -54,6 +70,34 @@ conflict=$(ss -H -lunp 2>/dev/null | awk '$4 ~ /(^|[^0-9])(0\.0\.0\.0|\*|\[::\])
 if [[ -n $conflict ]]; then
   warn "有程序监听所有地址的 53/67 端口，可能与回国 Wi-Fi 的 DHCP/DNS 冲突："
   echo "$conflict" >&2
+fi
+
+# LAN 口是无线网卡 → 热点模式：N150 自己用 hostapd 发射回国 Wi-Fi，不需要另外的 AP
+LAN_WIFI=0
+if is_wireless "$LAN_IF"; then
+  LAN_WIFI=1
+  WIFI_SSID=${WIFI_SSID:-CN-WiFi}; WIFI_CHANNEL=${WIFI_CHANNEL:-11}; WIFI_COUNTRY=${WIFI_COUNTRY:-SG}
+  bytes()    { printf %s "$1" | wc -c; }
+  bytes_in() { printf %s "$1" | LC_ALL=C tr -dc "$2" | wc -c; }   # $1 里属于字符集 $2 的字节数
+  [[ -n ${WIFI_PASS:-} ]] || die "$LAN_IF 是无线网卡（热点模式），config.env 里需要 WIFI_PASS（8–63 位）。参考 README 加上 WIFI_SSID / WIFI_PASS / WIFI_CHANNEL / WIFI_COUNTRY"
+  (( $(bytes "$WIFI_PASS") >= 8 && $(bytes "$WIFI_PASS") <= 63 && $(bytes_in "$WIFI_PASS" ' -~') == $(bytes "$WIFI_PASS") )) \
+    || die "WIFI_PASS 要 8–63 位，只能用英文字母、数字和符号"
+  (( $(bytes "$WIFI_SSID") <= 32 && $(bytes_in "$WIFI_SSID" '\000-\037\177') == 0 )) || die "WIFI_SSID 最长 32 字节（一个汉字 3 字节），不能有控制字符"
+  [[ $WIFI_CHANNEL =~ ^([1-9]|1[0-3])$ ]] || die "WIFI_CHANNEL=$WIFI_CHANNEL：只支持 2.4 GHz 信道 1–13（扫地机等设备只认 2.4 GHz）"
+  [[ $WIFI_COUNTRY =~ ^[A-Z]{2}$ ]] || die "WIFI_COUNTRY=$WIFI_COUNTRY：要两位大写国家代码，如 SG"
+  modes=$(wifi_modes "$LAN_IF")
+  if [[ -n $modes ]] && ! grep -qx AP <<<"$modes"; then
+    die "$LAN_IF 不支持 AP（热点）模式（支持: $(echo "$modes" | tr '\n' ' ')），只能接外部 AP"
+  fi
+  for u in "wpa_supplicant@$LAN_IF" "netplan-wpa-$LAN_IF"; do
+    systemctl is-active -q "$u" 2>/dev/null \
+      && die "$u 正在用 $LAN_IF 连别的 Wi-Fi。先停用它（netplan 的话从 wifis: 里删掉 $LAN_IF 再 netplan apply）"
+  done
+  other_ap=$(pgrep -ax hostapd 2>/dev/null | grep -vF /etc/cnwifi/hostapd.conf || true)
+  if [[ -n $other_ap ]]; then
+    warn "已有别的 hostapd 在运行，若它占用 $LAN_IF，cnwifi-hostapd 会起不来："
+    echo "$other_ap" >&2
+  fi
 fi
 
 # =====================================================================
@@ -76,8 +120,15 @@ command -v ping     >/dev/null || { ((apt)) && need+=(iputils-ping) || need+=(ip
 command -v dig      >/dev/null || { ((apt)) && need+=(dnsutils) || need+=(bind-utils); }
 # Debian/Ubuntu 用 dnsmasq-base：只有程序，没有会监听所有网卡的 dnsmasq.service
 command -v dnsmasq  >/dev/null || { ((apt)) && need+=(dnsmasq-base) || need+=(dnsmasq); }
+if ((LAN_WIFI)); then
+  # Ubuntu 装完 hostapd 后系统自带的 hostapd.service 是 masked 的，保持不动；用自己的 cnwifi-hostapd.service
+  command -v hostapd >/dev/null || need+=(hostapd)
+  command -v iw      >/dev/null || need+=(iw)
+fi
 if ((${#need[@]})); then log "安装: ${need[*]}"; pkg_install "${need[@]}"; fi
 NFT=$(command -v nft); DNSMASQ=$(command -v dnsmasq)
+HOSTAPD=""
+if ((LAN_WIFI)); then HOSTAPD=$(command -v hostapd) || die "没装上 hostapd"; fi
 
 modprobe wireguard 2>/dev/null || true
 if ip link add cnwifi-wgtest type wireguard 2>/dev/null; then
@@ -101,10 +152,12 @@ id wstunnel >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /non
 # =====================================================================
 # 3. 配置文件
 # =====================================================================
-# 如果之前装过且 LAN 口换了，先撤掉旧网关地址
-if [[ -r /etc/cnwifi/cnwifi.env ]]; then
-  old_if=$(. /etc/cnwifi/cnwifi.env; echo "$LAN_IF"); old_addr=$(. /etc/cnwifi/cnwifi.env; echo "$LAN_ADDR/$LAN_PREFIX")
-  [[ $old_if != "$LAN_IF" ]] && ip addr del "$old_addr" dev "$old_if" 2>/dev/null || true
+# 换了 LAN 口 / 网关地址重装：先停看门狗。它每分钟按 cnwifi.env 自愈——在旧配置下会把要撤掉的
+# 旧网关地址加回来；cnwifi.env 改写之后、新的 nft 规则文件写好之前，又会按半新半旧的配置提前 apply。
+# 第 5 步会重新启动它。
+if ((move_lan)) && have_systemd; then
+  log "LAN 口 $old_if ($old_gw) → $LAN_IF ($LAN_ADDR/$LAN_PREFIX)：先停看门狗"
+  systemctl stop cnwifi-watchdog.timer cnwifi-watchdog.service 2>/dev/null || true
 fi
 install -d -m 0755 /etc/cnwifi /var/lib/cnwifi
 cat >/etc/cnwifi/cnwifi.env <<EOF
@@ -248,6 +301,36 @@ EOF
 } >/etc/cnwifi/dnsmasq.conf
 "$DNSMASQ" --test --conf-file=/etc/cnwifi/dnsmasq.conf >/dev/null 2>&1 || { "$DNSMASQ" --test --conf-file=/etc/cnwifi/dnsmasq.conf; die "dnsmasq 配置检查失败"; }
 
+# ---- hostapd（热点模式；含 Wi-Fi 密码，权限 600） ----
+if ((LAN_WIFI)); then
+  utf8_ssid=""
+  (( $(bytes_in "$WIFI_SSID" '\200-\377') > 0 )) && utf8_ssid="utf8_ssid=1"
+  install -m 600 /dev/null /etc/cnwifi/hostapd.conf   # 先建成 600 再写入，密码不会有可读窗口
+  cat >/etc/cnwifi/hostapd.conf <<EOF
+$MARK
+# 回国 Wi-Fi 热点（$LAN_IF）。只支持 2.4 GHz：扫地机等设备只认 2.4 GHz
+interface=$LAN_IF
+driver=nl80211
+ctrl_interface=/run/cnwifi-hostapd
+ssid=$WIFI_SSID
+$utf8_ssid
+country_code=$WIFI_COUNTRY
+ieee80211d=1
+hw_mode=g
+channel=$WIFI_CHANNEL
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$WIFI_PASS
+max_num_sta=16
+EOF
+else
+  rm -f /etc/cnwifi/hostapd.conf
+fi
+
 # ---- cnwifi 工具 ----
 install -m 0755 "$HERE/n150/cnwifi" /usr/local/sbin/cnwifi
 
@@ -336,6 +419,29 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+if ((LAN_WIFI)); then
+  cat >/etc/systemd/system/cnwifi-hostapd.service <<EOF
+$MARK
+[Unit]
+Description=cnwifi Wi-Fi AP on $LAN_IF (hostapd)
+# 防护（nft + 策略路由 + 网关地址）全部就位之后才发射信号
+Requires=cnwifi-policy.service
+After=cnwifi-policy.service $LAN_DEV
+
+[Service]
+ExecStart=$HOSTAPD /etc/cnwifi/hostapd.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+elif [[ -e /etc/systemd/system/cnwifi-hostapd.service ]]; then
+  log "LAN 口不再是无线网卡，停用之前装的 cnwifi-hostapd"
+  if have_systemd; then systemctl disable --now cnwifi-hostapd.service >/dev/null 2>&1 || true; fi
+  rm -f /etc/systemd/system/cnwifi-hostapd.service
+fi
+
 cat >/etc/systemd/system/cnwifi-wstunnel.service <<EOF
 $MARK
 [Unit]
@@ -361,6 +467,14 @@ PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# 外层 TCP 用 BBR，只对到 ECS 的主机路由生效（见 cnwifi bbr-route）。"-" 失败也照常起隧道，"+" 以 root 运行
+install -d /etc/systemd/system/cnwifi-wstunnel.service.d
+cat >/etc/systemd/system/cnwifi-wstunnel.service.d/bbr.conf <<EOF
+$MARK
+[Service]
+ExecStartPre=-+/usr/local/sbin/cnwifi bbr-route
 EOF
 
 install -d "/etc/systemd/system/wg-quick@$WG_IF.service.d"
@@ -396,21 +510,31 @@ WantedBy=timers.target
 EOF
 
 # =====================================================================
-# 5. 启动（顺序：防护 → DHCP/DNS → 隧道 → 看门狗）
+# 5. 启动（顺序：防护 → DHCP/DNS → 热点 → 隧道 → 看门狗）
 # =====================================================================
 sysctl -q -p /etc/sysctl.d/99-zzz-cnwifi.conf 2>/dev/null || true
+
+# 撤掉上次安装留在旧 LAN 口上的网关地址和 iif 旧口 的 ip rule（看门狗已停，不会再加回来）。
+# nft 表 inet cnwifi 全程不动，旧口的 leak-guard 一直在；新口的防护接着由 cnwifi apply --reset
+# 按"防火墙 → 黑洞路由 → 策略规则 → 网关地址"的顺序装上。
+if ((move_lan)); then
+  log "撤掉 $old_if 上的旧网关地址 $old_gw"
+  ip addr del "$old_gw" dev "$old_if" 2>/dev/null || true
+  if [[ $old_if != "$LAN_IF" ]]; then
+    for p in 1000 1001; do while ip rule del pref "$p" iif "$old_if" 2>/dev/null; do :; done; done
+  fi
+fi
+
+units=(cnwifi-policy cnwifi-dnsmasq)
+((LAN_WIFI)) && units+=(cnwifi-hostapd)
+units+=(cnwifi-wstunnel "wg-quick@$WG_IF" cnwifi-watchdog.timer)
 if have_systemd; then
   systemctl daemon-reload
-  systemctl enable cnwifi-policy.service cnwifi-dnsmasq.service cnwifi-wstunnel.service \
-                   "wg-quick@$WG_IF.service" cnwifi-watchdog.timer >/dev/null 2>&1
+  systemctl enable "${units[@]}" >/dev/null 2>&1
   # 已有防护时可以安全地重置规则（nft 里的 leak-guard 先就位）
   if nft list table inet cnwifi >/dev/null 2>&1; then /usr/local/sbin/cnwifi apply --reset; fi
-  systemctl restart cnwifi-policy.service
-  systemctl restart cnwifi-dnsmasq.service
-  systemctl restart cnwifi-wstunnel.service
-  systemctl restart "wg-quick@$WG_IF.service"
-  systemctl restart cnwifi-watchdog.timer
-  for u in cnwifi-policy cnwifi-dnsmasq cnwifi-wstunnel "wg-quick@$WG_IF" cnwifi-watchdog.timer; do
+  for u in "${units[@]}"; do systemctl restart "$u"; done
+  for u in "${units[@]}"; do
     systemctl is-active -q "$u" || { systemctl --no-pager -l status "$u" | tail -20; die "$u 没起来"; }
   done
   log "所有服务已启动，等待隧道握手 ..."

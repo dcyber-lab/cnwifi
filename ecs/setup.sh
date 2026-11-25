@@ -127,6 +127,25 @@ sysctl -q -p /etc/sysctl.d/99-zzz-cnwifi.conf
 if grep -Eq '^\s*net\.ipv4\.ip_forward\s*=\s*0' /etc/sysctl.conf 2>/dev/null; then
   warn "/etc/sysctl.conf 里有 net.ipv4.ip_forward=0，如果有人跑 sysctl --system 会被覆盖；建议删掉那一行"
 fi
+# 外层 wstunnel 是一条跨境长 TCP（新加坡→广州实测 RTT 300ms+、晚高峰丢包 10–30%），cubic 会塌到几乎不动，
+# WG 握手和 N150 看门狗的 ping 都跟着卡住。ECS 是专用机，全局开 BBR（N150 端只对到 ECS 的路由开）。
+install -d /etc/modules-load.d
+cat >/etc/modules-load.d/cnwifi-bbr.conf <<EOF
+$MARK
+tcp_bbr
+EOF
+cat >/etc/sysctl.d/99-zzz-cnwifi-bbr.conf <<EOF
+$MARK
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+modprobe tcp_bbr 2>/dev/null || true
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+  sysctl -q -p /etc/sysctl.d/99-zzz-cnwifi-bbr.conf || warn "BBR sysctl 没有全部生效"
+  log "TCP 拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control)"
+else
+  warn "内核没有 BBR（tcp_bbr），外层 TCP 仍用 $(sysctl -n net.ipv4.tcp_congestion_control)，晚高峰可能很慢"
+fi
 
 # ---------- 6. nftables（独立的 table，不碰系统其它规则） ----------
 WG_NET="$(echo "$WG_ECS_ADDR" | cut -d. -f1-3).0/$WG_PREFIX"

@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# cnwifi — 回国 Wi-Fi 管理工具（N150 端，安装到 /usr/local/sbin/cnwifi）
+#
+#   cnwifi status      查看状态（服务、隧道、策略路由、防火墙计数、DHCP 租约、日志）
+#   cnwifi test        验收自检（出口 IP、DNS、fail-closed 防护是否完整）
+#   cnwifi failtest    断网演练：停 wstunnel、再停 wg0，确认不会漏到新加坡，然后恢复
+#   cnwifi apply       加载/修复防护（防火墙 + 策略路由 + LAN 地址）；开机由 cnwifi-policy.service 调用
+#   cnwifi check       只检查防护是否完整（返回码 0 = 完整）
+#   cnwifi watchdog    看门狗（cnwifi-watchdog.timer 每分钟调用）
+#   cnwifi uninstall   卸载
+set -uo pipefail
+
+CONF=${CNWIFI_CONF:-/etc/cnwifi/cnwifi.env}
+NFT_FILE=/etc/cnwifi/cnwifi.nft
+LOG=/var/log/cnwifi.log
+STATE=/run/cnwifi
+P_LAN=1000 P_LAN_BH=1001 P_DNS=1002 P_DNS_BH=1003
+MARK="# managed-by: cnwifi"
+
+[[ -r $CONF ]] || { echo "找不到 $CONF（还没安装？）" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONF"
+TEST_CLIENT=${DHCP_START}
+
+FAILS=0
+ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m✘\033[0m %s\n' "$*"; FAILS=$((FAILS + 1)); }
+note() { printf '  \033[33m•\033[0m %s\n' "$*"; }
+hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
+logev() {
+  mkdir -p "${LOG%/*}"
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+  command -v logger >/dev/null && logger -t cnwifi -- "$*" 2>/dev/null
+  return 0
+}
+need_root() { [[ $EUID -eq 0 ]] || { echo "需要 root：sudo cnwifi $*" >&2; exit 1; }; }
+have_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; }
+
+wg_up() { [[ -n $(ip link show dev "$WG_IF" up 2>/dev/null) ]]; }
+
+svc_active() {  # 没有 systemd 时退化为看进程/接口
+  if have_systemd; then systemctl is-active -q "$1"; return; fi
+  case $1 in
+    cnwifi-policy*)   check_guards >/dev/null ;;
+    cnwifi-dnsmasq*)  pgrep -f 'dnsmasq .*cnwifi' >/dev/null ;;
+    cnwifi-wstunnel*) pgrep -f 'wstunnel client' >/dev/null ;;
+    wg-quick@*)       wg_up ;;
+    *) return 1 ;;
+  esac
+}
+svc() { have_systemd && systemctl "$@"; }
+
+# ---------------------------------------------------------------- 防护
+ensure_rule() {  # 已存在则内核返回 EEXIST，忽略
+  local out
+  out=$(ip rule add "$@" 2>&1) || [[ $out == *"File exists"* ]] || { echo "ip rule add $*: $out" >&2; return 1; }
+}
+del_rules() {
+  local p
+  for p in $P_LAN $P_LAN_BH $P_DNS $P_DNS_BH; do
+    while ip rule del pref "$p" 2>/dev/null; do :; done
+  done
+}
+ensure_wg_route() {
+  if wg_up; then ip route replace default dev "$WG_IF" table "$RT_TABLE" metric 100; fi
+}
+compat_docker() {  # Docker 把 iptables FORWARD 设成 DROP，需要在 DOCKER-USER 里放行（只影响连通性，不影响 fail-closed）
+  command -v iptables >/dev/null || return 0
+  iptables -w -nL DOCKER-USER >/dev/null 2>&1 || return 0
+  iptables -w -C DOCKER-USER -i "$LAN_IF" -o "$WG_IF" -j ACCEPT 2>/dev/null \
+    || iptables -w -I DOCKER-USER -i "$LAN_IF" -o "$WG_IF" -j ACCEPT
+  iptables -w -C DOCKER-USER -i "$WG_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -w -I DOCKER-USER -i "$WG_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+
+# 顺序很重要：防火墙 → 黑洞路由 → 策略规则 → 打开转发 → 最后才给 LAN 口配网关地址。
+# 网关地址出现之前，所有防护都已就位，所以开机过程中不存在泄漏窗口。
+cmd_apply() {
+  need_root apply
+  local d
+  nft -f "$NFT_FILE" || { echo "加载 $NFT_FILE 失败" >&2; return 1; }
+  ip route replace blackhole default table "$RT_TABLE" metric 200 || return 1
+  [[ ${1:-} == --reset ]] && del_rules
+  ensure_rule pref $P_LAN iif "$LAN_IF" lookup "$RT_TABLE" || return 1
+  ensure_rule pref $P_LAN_BH iif "$LAN_IF" blackhole || return 1
+  for d in $UPSTREAM_DNS; do
+    ensure_rule pref $P_DNS to "$d" lookup "$RT_TABLE" || return 1
+    ensure_rule pref $P_DNS_BH to "$d" blackhole || return 1
+  done
+  ensure_wg_route || return 1
+  compat_docker || true
+  sysctl -qw net.ipv4.ip_forward=1 || return 1
+
+  for _ in $(seq 30); do [[ -e /sys/class/net/$LAN_IF ]] && break; sleep 1; done
+  [[ -e /sys/class/net/$LAN_IF ]] || { echo "LAN 口 $LAN_IF 不存在" >&2; return 1; }
+  sysctl -qw "net.ipv6.conf.$LAN_IF.disable_ipv6=1" 2>/dev/null || true
+  ip link set "$LAN_IF" up || return 1
+  ip addr replace "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF" || return 1
+}
+
+check_guards() {  # 输出缺失项；全部在则返回 0
+  local miss=() d
+  nft list table inet cnwifi >/dev/null 2>&1 || miss+=("nft table inet cnwifi")
+  ip rule show pref $P_LAN 2>/dev/null | grep -qE "iif $LAN_IF .*lookup $RT_TABLE" || miss+=("ip rule $P_LAN")
+  ip rule show pref $P_LAN_BH 2>/dev/null | grep -qE "iif $LAN_IF .*blackhole" || miss+=("ip rule $P_LAN_BH")
+  for d in $UPSTREAM_DNS; do
+    ip rule show pref $P_DNS 2>/dev/null | grep -qF "to $d " || miss+=("ip rule $P_DNS($d)")
+    ip rule show pref $P_DNS_BH 2>/dev/null | grep -qF "to $d " || miss+=("ip rule $P_DNS_BH($d)")
+  done
+  ip route show table "$RT_TABLE" 2>/dev/null | grep -q '^blackhole default' || miss+=("table $RT_TABLE blackhole")
+  if wg_up; then
+    ip route show table "$RT_TABLE" 2>/dev/null | grep -q "^default dev $WG_IF" || miss+=("table $RT_TABLE default dev $WG_IF")
+  fi
+  ip -4 -o addr show dev "$LAN_IF" 2>/dev/null | grep -qF " $LAN_ADDR/$LAN_PREFIX " || miss+=("$LAN_IF 地址 $LAN_ADDR")
+  [[ $(sysctl -n net.ipv4.ip_forward 2>/dev/null) == 1 ]] || miss+=("ip_forward")
+  ((${#miss[@]})) && printf '%s\n' "${miss[@]}"
+  ((${#miss[@]} == 0))
+}
+cmd_check() { local m; if m=$(check_guards); then echo "防护完整"; else echo "防护缺失:"; echo "$m" | sed 's/^/  - /'; return 1; fi; }
+
+# 模拟"回国 Wi-Fi 客户端访问外网"的内核路由判定
+route_verdict() {  # $1 = 目的地址
+  local out
+  out=$(ip -4 route get "$1" from "$TEST_CLIENT" iif "$LAN_IF" 2>&1)
+  if [[ $out == *" dev $WG_IF "* || $out == *" dev $WG_IF" ]]; then echo wg
+  elif [[ $out == blackhole* || $out == *"Invalid argument"* || $out == *"No route"* || $out == *"unreachable"* || $out == *"prohibit"* ]]; then echo blocked
+  elif [[ $out == *" dev $WAN_IF"* ]]; then echo LEAK
+  else echo "unknown: $out"; fi
+}
+local_verdict() {  # N150 本机发往 $1（DNS 上游）走哪
+  local out
+  out=$(ip -4 route get "$1" 2>&1)
+  if [[ $out == *" dev $WG_IF"* ]]; then echo wg
+  elif [[ $out == blackhole* || $out == *"Invalid argument"* || $out == *"unreachable"* ]]; then echo blocked
+  elif [[ $out == *" dev $WAN_IF"* ]]; then echo LEAK
+  else echo "unknown: $out"; fi
+}
+
+tunnel_ok() {
+  for _ in 1 2 3; do
+    ping -n -q -c1 -W3 -I "$WG_IF" "$WG_ECS_ADDR" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+handshake_age() {
+  local t
+  t=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+  if [[ -n $t && $t != 0 ]]; then echo "$(( $(date +%s) - t ))s 前"; else echo "无"; fi
+}
+leak_counter() {  # leak-guard 规则累计丢弃的包数
+  nft -a list chain inet cnwifi forward 2>/dev/null | awk '/leak-guard/{for(i=1;i<=NF;i++) if($i=="packets"){print $(i+1); exit}}'
+}
+egress_via() {  # $1 = 网卡（空 = 走默认路由）；输出第一个查询成功的结果
+  local u r args=(-4 -fsS --max-time 12)
+  [[ -n ${1:-} ]] && args+=(--interface "$1")
+  for u in $IPCHECK_URLS; do
+    r=$(curl "${args[@]}" "$u" 2>/dev/null | tr -s '\r\n\t ' ' ' | head -c 200) && [[ -n $r ]] && { echo "$r"; return 0; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 看门狗
+cmd_watchdog() {
+  need_root watchdog
+  mkdir -p "$STATE"
+  local now m fails last
+  now=$(date +%s)
+  if ! m=$(check_guards); then
+    logev "防护缺失 [$(echo "$m" | paste -sd, -)] → 重新加载"
+    cmd_apply >/dev/null 2>&1 || logev "cnwifi apply 失败！（回国 Wi-Fi 仍由已有规则/黑洞路由兜底）"
+  fi
+  compat_docker || true
+
+  if tunnel_ok; then
+    if [[ -e $STATE/down_since ]]; then
+      logev "隧道恢复（中断约 $(( now - $(cat "$STATE/down_since") ))s）"
+      rm -f "$STATE/down_since"
+    fi
+    echo 0 >"$STATE/fails"
+    return 0
+  fi
+  fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
+  echo "$fails" >"$STATE/fails"
+  [[ -e $STATE/down_since ]] || echo "$now" >"$STATE/down_since"
+  logev "隧道不通（连续第 $fails 次）wstunnel=$(svc_active cnwifi-wstunnel && echo up || echo down) $WG_IF=$(wg_up && echo up || echo down) 最近握手=$(handshake_age)"
+  last=$(cat "$STATE/last_restart" 2>/dev/null || echo 0)
+  if (( fails >= 2 && now - last >= 120 )); then
+    logev "重启 cnwifi-wstunnel 和 wg-quick@$WG_IF"
+    svc restart cnwifi-wstunnel.service
+    sleep 2
+    svc restart "wg-quick@$WG_IF.service"
+    echo "$now" >"$STATE/last_restart"
+  fi
+}
+
+# ---------------------------------------------------------------- 状态
+cmd_status() {
+  local u
+  hdr "== 服务"
+  for u in cnwifi-policy cnwifi-dnsmasq cnwifi-wstunnel "wg-quick@$WG_IF" cnwifi-watchdog.timer; do
+    printf '  %-26s %s\n' "$u" "$(svc_active "$u" && echo active || echo INACTIVE)"
+  done
+  hdr "== 隧道"
+  if wg_up; then
+    wg show "$WG_IF" | sed 's/^/  /'
+    tunnel_ok && ok "ping ECS 隧道地址 $WG_ECS_ADDR 通" || bad "ping ECS 隧道地址 $WG_ECS_ADDR 不通"
+  else
+    bad "$WG_IF 不存在/未启动"
+  fi
+  hdr "== fail-closed 防护"
+  cmd_check | sed 's/^/  /'
+  ip rule show | grep -E "^($P_LAN|$P_LAN_BH|$P_DNS|$P_DNS_BH):" | sed 's/^/  /'
+  echo "  table $RT_TABLE:"; ip route show table "$RT_TABLE" | sed 's/^/    /'
+  echo "  回国 Wi-Fi 客户端访问 1.1.1.1 → $(route_verdict 1.1.1.1)   （wg=走隧道 blocked=黑洞 LEAK=泄漏）"
+  echo "  泄漏拦截计数 (eth1→eth0 被丢弃): $(leak_counter)"
+  hdr "== DHCP 租约"
+  if [[ -s /var/lib/cnwifi/dnsmasq.leases ]]; then
+    awk '{printf "  %s  %s  %s\n", $3, $2, $4}' /var/lib/cnwifi/dnsmasq.leases
+  else
+    echo "  （暂无）"
+  fi
+  hdr "== 最近日志 ($LOG)"
+  tail -n 8 "$LOG" 2>/dev/null | sed 's/^/  /' || echo "  （暂无）"
+}
+
+# ---------------------------------------------------------------- 验收
+cmd_test() {
+  need_root test
+  FAILS=0
+  local u v m mtu_payload r d
+  hdr "[1] 服务"
+  for u in cnwifi-policy cnwifi-dnsmasq cnwifi-wstunnel "wg-quick@$WG_IF"; do
+    svc_active "$u" && ok "$u" || bad "$u 未运行"
+  done
+  have_systemd && { systemctl is-active -q cnwifi-watchdog.timer && ok "cnwifi-watchdog.timer" || bad "cnwifi-watchdog.timer 未运行"; }
+
+  hdr "[2] fail-closed 防护"
+  if m=$(check_guards); then ok "防火墙 / 策略路由 / 黑洞路由 / LAN 地址 齐全"; else bad "防护缺失: $(echo "$m" | paste -sd, -)"; fi
+  v=$(route_verdict 1.1.1.1)
+  [[ $v == wg ]] && ok "回国 Wi-Fi 客户端流量 → $WG_IF" || bad "回国 Wi-Fi 客户端流量判定为: $v"
+  for d in $UPSTREAM_DNS; do
+    v=$(local_verdict "$d")
+    [[ $v == wg ]] && ok "上游 DNS $d → $WG_IF" || bad "上游 DNS $d 判定为: $v"
+  done
+
+  hdr "[3] 隧道"
+  if tunnel_ok; then ok "ping $WG_ECS_ADDR 通（最近握手 $(handshake_age)）"; else bad "ping $WG_ECS_ADDR 不通（最近握手 $(handshake_age)）"; fi
+  mtu_payload=$(( WG_MTU - 28 ))
+  if ping -n -q -c2 -W3 -M "do" -s "$mtu_payload" -I "$WG_IF" "$WG_ECS_ADDR" >/dev/null 2>&1; then
+    ok "MTU $WG_MTU 满包不分片可通"
+  else
+    bad "MTU $WG_MTU 满包 ping 不通，考虑调小 WG_MTU"
+  fi
+
+  hdr "[4] 出口 IP"
+  if r=$(egress_via "$WG_IF"); then
+    if [[ $r == *"$ECS_IP"* ]]; then ok "隧道出口: $r"; else note "隧道出口: $r（与 ECS_IP=$ECS_IP 不同，若是 ECS 的其它公网 IP 也正常）"; fi
+  else
+    bad "经隧道查询出口 IP 失败（$IPCHECK_URLS）"
+  fi
+  if r=$(egress_via ""); then ok "N150 自身/家里出口（应为新加坡）: $r"; else note "查询家里出口 IP 失败"; fi
+
+  hdr "[5] DNS"
+  if command -v dig >/dev/null; then
+    r=$(dig +short +time=5 +tries=1 @"$LAN_ADDR" www.taobao.com A | tail -1)
+    [[ -n $r ]] && ok "dnsmasq($LAN_ADDR) 解析 www.taobao.com → $r" || bad "dnsmasq($LAN_ADDR) 解析失败"
+    r=$(dig +short +time=5 +tries=1 @"$LAN_ADDR" whoami.akamai.net A | tail -1)
+    [[ -n $r ]] && note "上游递归 DNS 出口（应为阿里 DNS 大陆节点）: $r"
+  else
+    note "未安装 dig，跳过"
+  fi
+
+  hdr "结果"
+  if ((FAILS == 0)); then ok "全部通过"; else bad "$FAILS 项失败"; fi
+  ((FAILS == 0))
+}
+
+# ---------------------------------------------------------------- 断网演练
+cmd_failtest() {
+  need_root failtest
+  FAILS=0
+  local wait=${1:-0} v c0 c1 cap
+  tunnel_ok || { echo "隧道当前就不通，先修好再演练（cnwifi status）"; return 1; }
+  c0=$(leak_counter)
+  svc stop cnwifi-watchdog.timer
+  # shellcheck disable=SC2064
+  trap "svc start cnwifi-wstunnel.service; svc start wg-quick@$WG_IF.service; svc start cnwifi-watchdog.timer" EXIT
+
+  hdr "[A] 停掉 wstunnel"
+  svc stop cnwifi-wstunnel.service
+  sleep 3
+  tunnel_ok && bad "停了 wstunnel 隧道居然还通？" || ok "隧道不通（符合预期）"
+  v=$(route_verdict 1.1.1.1)
+  [[ $v == wg ]] && ok "客户端流量仍进 $WG_IF（加密后发往已停止的 wstunnel，被丢弃，不会明文出去）" || bad "判定为: $v"
+  if command -v tcpdump >/dev/null; then
+    cap=$(timeout 6 tcpdump -nni "$WAN_IF" -c 5 "src net $LAN_ADDR/$LAN_PREFIX" 2>/dev/null | wc -l)
+    [[ $cap -eq 0 ]] && ok "6 秒内 $WAN_IF 上没有来自回国网段的包" || bad "$WAN_IF 上抓到 $cap 个回国网段的包！"
+  fi
+  if ((wait > 0)); then
+    note "现在用连着回国 Wi-Fi 的手机打开 cip.cc —— 应该完全打不开。等待 ${wait}s ..."
+    sleep "$wait"
+  fi
+
+  hdr "[B] 再停掉 $WG_IF"
+  svc stop "wg-quick@$WG_IF.service"
+  sleep 1
+  v=$(route_verdict 1.1.1.1)
+  [[ $v == blocked ]] && ok "客户端流量 → 黑洞（table $RT_TABLE blackhole 兜底）" || bad "判定为: $v"
+  for d in $UPSTREAM_DNS; do
+    v=$(local_verdict "$d")
+    [[ $v == blocked ]] && ok "上游 DNS $d → 黑洞" || bad "上游 DNS $d 判定为: $v"
+  done
+  if command -v tcpdump >/dev/null; then
+    cap=$(timeout 6 tcpdump -nni "$WAN_IF" -c 5 "src net $LAN_ADDR/$LAN_PREFIX" 2>/dev/null | wc -l)
+    [[ $cap -eq 0 ]] && ok "6 秒内 $WAN_IF 上没有来自回国网段的包" || bad "$WAN_IF 上抓到 $cap 个回国网段的包！"
+  fi
+  if ((wait > 0)); then
+    note "手机再试一次 cip.cc —— 仍然应该打不开。等待 ${wait}s ..."
+    sleep "$wait"
+  fi
+
+  hdr "[C] 恢复"
+  svc start cnwifi-wstunnel.service
+  svc start "wg-quick@$WG_IF.service"
+  for _ in $(seq 20); do tunnel_ok && break; sleep 2; done
+  tunnel_ok && ok "隧道已恢复" || bad "40 秒内没恢复，看 journalctl -u cnwifi-wstunnel -u wg-quick@$WG_IF"
+  [[ $(route_verdict 1.1.1.1) == wg ]] && ok "客户端流量重新走 $WG_IF" || bad "恢复后路由判定异常"
+  svc start cnwifi-watchdog.timer
+  trap - EXIT
+  c1=$(leak_counter)
+  note "leak-guard 拦截计数: 演练前 ${c0:-?} → 演练后 ${c1:-?}（路由层已黑洞，正常应不变）"
+
+  hdr "结果"
+  if ((FAILS == 0)); then ok "fail-closed 演练通过"; else bad "$FAILS 项失败"; fi
+  ((FAILS == 0))
+}
+
+# ---------------------------------------------------------------- 卸载
+cmd_uninstall() {
+  need_root uninstall
+  read -r -p "确定卸载回国 Wi-Fi？[y/N] " a; [[ $a == y || $a == Y ]] || return 1
+  svc disable --now cnwifi-watchdog.timer cnwifi-dnsmasq.service 2>/dev/null
+  ip addr del "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF" 2>/dev/null   # 先撤网关，客户端立刻失去出口
+  svc disable --now cnwifi-wstunnel.service "wg-quick@$WG_IF.service" 2>/dev/null
+  del_rules
+  ip route flush table "$RT_TABLE" 2>/dev/null
+  nft delete table inet cnwifi 2>/dev/null
+  svc disable --now cnwifi-policy.service 2>/dev/null
+  rm -f /etc/systemd/system/cnwifi-{policy,dnsmasq,wstunnel,watchdog}.{service,timer} \
+        /etc/systemd/system/wg-quick@"$WG_IF".service.d/cnwifi.conf \
+        /etc/sysctl.d/99-zzz-cnwifi.conf /etc/logrotate.d/cnwifi \
+        /etc/NetworkManager/conf.d/90-cnwifi.conf /etc/systemd/network/05-cnwifi-lan.network
+  grep -qF "$MARK" "/etc/wireguard/$WG_IF.conf" 2>/dev/null && rm -f "/etc/wireguard/$WG_IF.conf"
+  rm -rf /etc/cnwifi /var/lib/cnwifi "$STATE"
+  svc daemon-reload
+  rm -f /usr/local/sbin/cnwifi
+  echo "已卸载（/usr/local/bin/wstunnel 和日志 $LOG 保留；net.ipv4.ip_forward 运行时仍为 1，重启后恢复系统默认）"
+}
+
+case ${1:-status} in
+  apply)     shift; cmd_apply "$@" ;;
+  check)     cmd_check ;;
+  status)    cmd_status ;;
+  test)      cmd_test ;;
+  failtest)  shift; cmd_failtest "${1:-0}" ;;
+  watchdog)  cmd_watchdog ;;
+  uninstall) cmd_uninstall ;;
+  -h|--help|help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "未知命令 $1（cnwifi help）"; exit 2 ;;
+esac

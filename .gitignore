@@ -1,0 +1,5 @@
+# 含 WireGuard 私钥 / wstunnel 路径密钥，绝不提交
+config.env
+*.env
+# fetch-wstunnel.sh 下载的二进制和打包出来的 ECS 安装包（含 ECS 私钥）
+dist/

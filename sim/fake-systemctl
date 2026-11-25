@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# 仅用于仿真测试：容器里没有 systemd，按安装好的 unit 文件里的 ExecStart 启停服务。
+# 每个 netns 一套状态（/run/sim/<netns>/），unit 文件通过 /etc/netns/<ns>/systemd 隔离。
+NS=$(ip netns identify $$ 2>/dev/null); NS=${NS:-root}
+RUN=/run/sim/$NS; mkdir -p "$RUN"
+UD=/etc/systemd/system
+
+norm() { local u=$1; [[ $u == *.* ]] || u=$u.service; echo "$u"; }
+field() { sed -n "s/^$2=//p" "$UD/$1" | tail -1; }
+execstart() { awk '/^ExecStart=/{f=1; sub(/^ExecStart=/,"")} f{ if (sub(/\\$/,"")) printf "%s ", $0; else { print; exit } }' "$UD/$1"; }
+wgif() { local i=${1#wg-quick@}; echo "${i%.service}"; }
+
+is_active() {
+  local u; u=$(norm "$1")
+  case $u in
+    wg-quick@*) [[ -n $(ip link show dev "$(wgif "$u")" up 2>/dev/null) ]] ;;
+    *.timer) [[ -e $RUN/$u.active ]] ;;
+    *) [[ -r $UD/$u ]] || return 3
+       if [[ $(field "$u" Type) == oneshot ]]; then [[ -e $RUN/$u.active ]]
+       else [[ -s $RUN/$u.pid ]] && kill -0 "$(cat "$RUN/$u.pid")" 2>/dev/null; fi ;;
+  esac
+}
+
+# 在当前（子）shell 里 exec，保证后台启动时 $! 就是服务进程本身
+run_exec() {  # $1=unit $2=cmdline（含 ${VAR}）
+  local u=$1 line=$2 envf user
+  envf=$(field "$u" EnvironmentFile); user=$(field "$u" User)
+  set -a; [[ -n $envf ]] && . "${envf#-}"; set +a
+  line=$(eval "printf '%s' \"$line\"")
+  if [[ -n $user ]]; then
+    exec setpriv --reuid="$user" --regid="$user" --init-groups -- $line
+  else
+    exec $line
+  fi
+}
+
+start() {
+  local u; u=$(norm "$1")
+  is_active "$u" && return 0
+  case $u in
+    wg-quick@*) wg-quick up "$(wgif "$u")" >>"$RUN/$u.log" 2>&1; return ;;
+    *.timer) touch "$RUN/$u.active"; return 0 ;;
+  esac
+  [[ -r $UD/$u ]] || { echo "Unit $u not found." >&2; return 5; }
+  local pre; pre=$(field "$u" ExecStartPre)
+  if [[ -n $pre ]]; then
+    ( run_exec "$u" "$pre" ) >>"$RUN/$u.log" 2>&1 || { echo "$u: ExecStartPre failed" >&2; return 1; }
+  fi
+  if [[ $(field "$u" Type) == oneshot ]]; then
+    ( run_exec "$u" "$(execstart "$u")" ) >>"$RUN/$u.log" 2>&1 || { echo "$u failed (see $RUN/$u.log)" >&2; return 1; }
+    [[ $(field "$u" RemainAfterExit) == yes ]] && touch "$RUN/$u.active"
+    return 0
+  fi
+  run_exec "$u" "$(execstart "$u")" >>"$RUN/$u.log" 2>&1 &
+  echo $! >"$RUN/$u.pid"
+  sleep 0.5
+  is_active "$u" || { echo "$u exited immediately:" >&2; tail -5 "$RUN/$u.log" >&2; return 1; }
+}
+
+stop() {
+  local u; u=$(norm "$1")
+  case $u in
+    wg-quick@*) is_active "$u" && wg-quick down "$(wgif "$u")" >>"$RUN/$u.log" 2>&1; return 0 ;;
+    *.timer) rm -f "$RUN/$u.active"; return 0 ;;
+  esac
+  if [[ -s $RUN/$u.pid ]]; then
+    local p; p=$(cat "$RUN/$u.pid")
+    kill "$p" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+    kill -9 "$p" 2>/dev/null
+    rm -f "$RUN/$u.pid"
+  fi
+  rm -f "$RUN/$u.active"
+}
+
+quiet=0 now=0 units=()
+cmd=$1; shift
+for a in "$@"; do
+  case $a in -q|--quiet) quiet=1 ;; --now) now=1 ;; --no-pager|-l) ;; *) units+=("$a") ;; esac
+done
+rc=0
+case $cmd in
+  daemon-reload|reload) ;;
+  enable)  ((now)) && for u in "${units[@]}"; do start "$u" || rc=1; done ;;
+  disable) ((now)) && for u in "${units[@]}"; do stop "$u"; done ;;
+  start)   for u in "${units[@]}"; do start "$u" || rc=1; done ;;
+  stop)    for u in "${units[@]}"; do stop "$u"; done ;;
+  restart) for u in "${units[@]}"; do stop "$u"; start "$u" || rc=1; done ;;
+  is-active)
+    for u in "${units[@]}"; do
+      if is_active "$u"; then ((quiet)) || echo active; else ((quiet)) || echo inactive; rc=3; fi
+    done ;;
+  status)  for u in "${units[@]}"; do u=$(norm "$u"); echo "● $u"; tail -20 "$RUN/$u.log" 2>/dev/null; done ;;
+  *) echo "fake-systemctl: unsupported $cmd" >&2; rc=1 ;;
+esac
+exit $rc
